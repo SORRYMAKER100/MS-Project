@@ -1,8 +1,25 @@
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
 
+# CoordConv implementation that accepts external coordinates
+class CoordConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, dilation=1, groups=1, bias=True, with_r=False):
+        super(CoordConv2d, self).__init__()
+        self.with_r = with_r
+        extra_channels = 2 + int(with_r)  # x and y coordinates, optionally radius
+        self.conv = nn.Conv2d(in_channels + extra_channels, out_channels,
+                              kernel_size, stride, padding, dilation, groups, bias)
+
+    def forward(self, x, coords):
+        # x: [batch_size, in_channels, height, width]
+        # coords: [batch_size, 2, height, width] or [batch_size, 3, height, width] if with_r is True
+        x = torch.cat([x, coords], dim=1)
+        x = self.conv(x)
+        return x
+
+# LayerNorm function
 class LayerNormFunction(torch.autograd.Function):
 
     @staticmethod
@@ -58,16 +75,16 @@ class SCA(nn.Module):
         y = self.conv(y)
         return x * y
 
-# NAFBlock with positional encoding
+# NAFBlock with CoordConv accepting external coordinates
 class NAFBlock(nn.Module):
     def __init__(self, c):
         super(NAFBlock, self).__init__()
         dw_channel = c * 2
 
-        # Replace CoordGate with Conv2d layers
-        self.conv1 = nn.Conv2d(c, dw_channel, kernel_size=3, padding=1, stride=1)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, kernel_size=3, padding=1, stride=1)
-        self.conv3 = nn.Conv2d(dw_channel // 2, c, kernel_size=3, padding=1, stride=1)
+        # Replace standard Conv2d with CoordConv2d accepting external coords
+        self.conv1 = CoordConv2d(c, dw_channel, kernel_size=3, padding=1, stride=1)
+        self.conv2 = CoordConv2d(dw_channel, dw_channel, kernel_size=3, padding=1, stride=1)
+        self.conv3 = CoordConv2d(dw_channel // 2, c, kernel_size=3, padding=1, stride=1)
 
         # Simplified Channel Attention
         self.sca = SCA(dw_channel // 2)
@@ -77,8 +94,8 @@ class NAFBlock(nn.Module):
 
         # FFN Part
         ffn_channel = c * 2
-        self.conv4 = nn.Conv2d(c, ffn_channel, kernel_size=3, padding=1, stride=1)
-        self.conv5 = nn.Conv2d(ffn_channel // 2, c, kernel_size=3, padding=1, stride=1)
+        self.conv4 = CoordConv2d(c, ffn_channel, kernel_size=3, padding=1, stride=1)
+        self.conv5 = CoordConv2d(ffn_channel // 2, c, kernel_size=3, padding=1, stride=1)
 
         # Using LayerNorm2d
         self.norm1 = LayerNorm2d(c)
@@ -87,37 +104,33 @@ class NAFBlock(nn.Module):
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
 
-    def forward(self, x, x_pe=None):
-        # Add positional encoding if provided
-        if x_pe is not None:
-            x = x + x_pe
-
+    def forward(self, x, coords):
         inp = x
 
         x = self.norm1(x)
 
-        x = self.conv1(x)
-        x = self.conv2(x)
+        x = self.conv1(x, coords)
+        x = self.conv2(x, coords)
         x = self.sg(x)
         x = self.sca(x)
-        x = self.conv3(x)
+        x = self.conv3(x, coords)
 
         y = inp + x * self.beta
 
         x = self.norm2(y)
-        x = self.conv4(x)
+        x = self.conv4(x, coords)
         x = self.sg(x)
-        x = self.conv5(x)
+        x = self.conv5(x, coords)
 
         return y + x * self.gamma
 
-# NAFNet with positional encoding
+# NAFNet with CoordConv accepting external coordinates
 class NAFNet(nn.Module):
-    def __init__(self, img_channel=1, width=32, middle_blk_num=1, enc_blk_nums=[1, 1, 1, 28], dec_blk_nums=[1, 1, 1, 1]):
+    def __init__(self, img_channel=1, width=32, middle_blk_num=1, enc_blk_nums=[1, 1, 1, 1], dec_blk_nums=[1, 1, 1, 1]):
         super(NAFNet, self).__init__()
 
-        self.intro = nn.Conv2d(img_channel, width, kernel_size=3, padding=1, stride=1)
-        self.ending = nn.Conv2d(width, 1, kernel_size=3, padding=1, stride=1)  # Output channel is 1
+        self.intro = CoordConv2d(img_channel, width, kernel_size=3, padding=1, stride=1)
+        self.ending = CoordConv2d(width, 1, kernel_size=3, padding=1, stride=1)  # Output channel is 1
 
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -133,7 +146,7 @@ class NAFNet(nn.Module):
             self.encoders.append(nn.Sequential(*encoder_layers))
             # Downsampling layer
             self.downs.append(
-                nn.Conv2d(chan, chan*2, kernel_size=3, padding=1, stride=2)
+                nn.Conv2d(chan, chan * 2, kernel_size=3, padding=1, stride=2)
             )
             chan *= 2
 
@@ -150,32 +163,52 @@ class NAFNet(nn.Module):
                 decoder_layers.append(NAFBlock(chan))
             self.decoders.append(nn.Sequential(*decoder_layers))
 
-    def forward(self, x, x_pe=None):
-        x = self.intro(x)
+    def forward(self, x, coords):
+        x = self.intro(x, coords)
 
         encs = []
         for encoder, down in zip(self.encoders, self.downs):
             for block in encoder:
-                x = block(x, x_pe)  # Pass positional encoding
+                x = block(x, coords)
             encs.append(x)
             x = down(x)
-            if x_pe is not None:
-                x_pe = F.avg_pool2d(x_pe, kernel_size=2, stride=2)  # Downsample positional encoding
+            coords = F.avg_pool2d(coords, kernel_size=2, stride=2)
 
         for blk in self.middle_blks:
-            x = blk(x, x_pe)  # Pass positional encoding
+            x = blk(x, coords)
 
         for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
             x = up(x)
+            coords = F.interpolate(coords, scale_factor=2, mode='nearest')
             x = x + enc_skip
-            if x_pe is not None:
-                x_pe = F.interpolate(x_pe, scale_factor=2, mode='bilinear', align_corners=False)  # Upsample positional encoding
             for block in decoder:
-                x = block(x, x_pe)  # Pass positional encoding
+                x = block(x, coords)
 
-        x = self.ending(x)
+        x = self.ending(x, coords)
 
         return x
+
+# Main FPNet architecture with CoordConv accepting external coordinates
+class FPNet(nn.Module):
+    def __init__(self):
+        super(FPNet, self).__init__()
+        self.model = NAFNet(
+            img_channel=1,
+            width=32,
+            middle_blk_num=1,
+            enc_blk_nums=[1, 1, 1],
+            dec_blk_nums=[1, 1, 1]
+        )
+        self.activation = nn.Sigmoid()
+
+    def forward(self, x, index):
+        # index: [batch_size, height, width, 2]
+        # Transpose to [batch_size, 2, height, width]
+        coords = index.permute(0, 3, 1, 2).to(x.device).float()
+
+        x = self.model(x, coords)
+        x = self.activation(x)
+        return x  # Output shape: [batch_size, 1, height, width]
 
 def indexGenerate(x_start, y_start, p, size):
     xs = torch.linspace(x_start, x_start + p - 1, steps=p)
@@ -184,50 +217,4 @@ def indexGenerate(x_start, y_start, p, size):
     x, y = x.unsqueeze(0)/size, y.unsqueeze(0)/size
     final = torch.cat((x, y), dim=0)
     final = torch.permute(final, (1, 2, 0))
-    return final    
-
-# Positional Encoding function
-def positional_encoding(index, c):
-    # index: [batch_size, height, width, 2]
-    batch_size, height, width, _ = index.shape
-    index = index.permute(0, 3, 1, 2)  # [batch_size, 2, height, width]
-
-    # Create a linear projection to map 2D positions to c channels
-    # Define a learnable linear layer
-    pe_linear = nn.Conv2d(2, c, kernel_size=1, bias=False).to(index.device)
-    # Initialize the weights to cover different frequencies
-    nn.init.xavier_uniform_(pe_linear.weight)
-
-    x_pe = pe_linear(index)
-    return x_pe  # [batch_size, c, height, width]
-
-# Main FPNet architecture with NAFNet
-class FPNet(nn.Module):
-    def __init__(self):
-        super(FPNet, self).__init__()
-        self.model = NAFNet(
-            img_channel=1,
-            width=32,
-            middle_blk_num=1,
-            enc_blk_nums=[1, 1, 1, 1],
-            dec_blk_nums=[1, 1, 1, 1]
-        )
-        self.activation = nn.Sigmoid()
-
-    def forward(self, x, index):
-        # Generate positional encoding
-        c = x.shape[1]  # Get the channel dimension
-        x_pe = positional_encoding(index, c)
-        x_pe = x_pe.to(x.device)  # Ensure x_pe is on the same device
-
-        # Add positional encoding before 'inp = x'
-        output = self.model(x)
-
-        output = self.activation(output)
-        return output  # Output shape: [batch_size, 1, height, width]
-
-def indexDown(index_list):
-    index_list = index_list.permute(0, 3, 1, 2)
-    output = F.avg_pool2d(index_list, kernel_size=2, stride=2)
-    output = output.permute(0, 2, 3, 1)
-    return output  # Output shape: downsampled [batch_size, height//2, width//2, channels]
+    return final  
